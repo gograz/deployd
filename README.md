@@ -38,9 +38,9 @@ to with a `409 Conflict` status.
 
 ## How to build
 
-In order to build DeployD locally you will need gb. You can find more details
-about that on [getgb.io](http://getgb.io/).
-
+```
+go build
+```
 
 ## Current limitations
 
