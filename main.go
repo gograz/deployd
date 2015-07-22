@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha1"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -19,6 +20,10 @@ const (
 	SAVE_CMD = iota
 	GET_CMD  = iota
 )
+
+type GithubPushEventData struct {
+	Ref string `json:"ref"`
+}
 
 func checkProjectFolder(folder string) error {
 	makefile := path.Join(folder, "Makefile")
@@ -91,7 +96,6 @@ func startWorker(projectFolder string, workChan chan struct{}, lockerChan chan L
 		case <-time.After(time.Second * 1):
 		}
 	}
-
 }
 
 type SignatureValidationError struct {
@@ -114,7 +118,7 @@ func verifySignature(payload *[]byte, signature, secret string) error {
 	return nil
 }
 
-func startHTTPD(secret, host string, workChan chan struct{}, lockerChan chan LockerCommand) {
+func startHTTPD(secret, host, branch string, workChan chan struct{}, lockerChan chan LockerCommand) {
 	log.Printf("Starting HTTPD on %s\n", host)
 	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
@@ -137,6 +141,18 @@ func startHTTPD(secret, host string, workChan chan struct{}, lockerChan chan Loc
 				http.Error(rw, fmt.Sprintf("Invalid signature: %s", err.Error()), http.StatusBadRequest)
 				return
 			}
+			if branch != "" {
+				eventData := GithubPushEventData{}
+				if err = json.Unmarshal(payload, &eventData); err != nil {
+					log.Printf("Failed to decode body: %s", err.Error())
+					http.Error(rw, fmt.Sprintf("Failed to decode body"), http.StatusBadRequest)
+					return
+				}
+				if eventData.Ref != "refs/heads/"+branch {
+					http.Error(rw, "Not-configured branch detected. No operation required.", http.StatusOK)
+					return
+				}
+			}
 			select {
 			case workChan <- struct{}{}:
 				fmt.Fprintf(rw, "Deployment started")
@@ -155,6 +171,7 @@ func main() {
 	host := flag.String("host", "127.0.0.1:9876", "Interface and port to listen on")
 	secret := flag.String("secret", "", "Github webhook secret")
 	statusFile := flag.String("statusFile", "", "Status file")
+	branch := flag.String("branch", "", "Restrict deployd to only trigger on a specific branch change")
 	flag.Parse()
 
 	if *secret == "" {
@@ -178,5 +195,5 @@ func main() {
 	}
 	go startStatusLocker(lockerChan, *statusFile)
 	go startWorker(*projectFolder, workChannel, lockerChan)
-	startHTTPD(*secret, *host, workChannel, lockerChan)
+	startHTTPD(*secret, *host, *branch, workChannel, lockerChan)
 }
