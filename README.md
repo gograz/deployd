@@ -38,7 +38,7 @@ to with a `409 Conflict` status.
 
 By default, DeployD will trigger a job execution no matter what valid payload it
 receives from Github. If you want only push events for a specific branch to
-matter, use the `-branch` flag.
+matter, use the `--branch` flag.
 
 
 ## How to build
