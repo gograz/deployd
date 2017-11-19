@@ -16,10 +16,11 @@ hugo for the production environment.
 Once you have that, simply start deployd like this:
 
 ```
-$ deployd -project /path/to/your/project -host 127.0.0.1:8000 -secret yourSecretToken -statusFile /path/to/statusfile
+$ deployd --project /path/to/your/project --host 127.0.0.1:8000 \
+    --secret yourSecretToken --status-file /path/to/statusfile
 ```
 
-DeployD listens on an interface and port that you specify with the `-host` flag
+DeployD listens on an interface and port that you specify with the `--host` flag
 and starts a simple HTTP server which you can then put behind an nginx or what
 have you.
 

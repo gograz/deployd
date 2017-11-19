@@ -1,19 +1,22 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha1"
+	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 )
 
 const (
@@ -21,7 +24,15 @@ const (
 	GET_CMD  = iota
 )
 
-type GithubPushEventData struct {
+type controller struct {
+	ctx        context.Context
+	wg         *sync.WaitGroup
+	logger     *logrus.Logger
+	errors     chan error
+	cancelFunc func()
+}
+
+type githubPushEventData struct {
 	Ref string `json:"ref"`
 }
 
@@ -31,11 +42,11 @@ func checkProjectFolder(folder string) error {
 	return err
 }
 
-type LockerCommand struct {
+type lockerCommand struct {
 	Command      int
 	Status       string
 	Output       string
-	ResponseChan chan LockerCommand
+	ResponseChan chan lockerCommand
 }
 
 func loadStatusFromFile(filepath string) (string, string, error) {
@@ -52,18 +63,22 @@ func saveStatusToFile(status, output, filepath string) error {
 	return ioutil.WriteFile(filepath, []byte(fmt.Sprintf("%s\n%s", status, output)), 0600)
 }
 
-func startStatusLocker(cmdChan chan LockerCommand, statusFile string) {
+func (c *controller) startStatusLocker(cmdChan chan lockerCommand, statusFile string) {
+	defer c.logger.Info("Stopping status locker")
+	defer c.wg.Done()
 	lastStatus := "not started"
 	lastOutput := "not started"
 
 	for {
 		select {
+		case <-c.ctx.Done():
+			return
 		case cmd := <-cmdChan:
 			if cmd.Command == SAVE_CMD {
 				lastStatus = cmd.Status
 				lastOutput = cmd.Output
 				if err := saveStatusToFile(lastStatus, lastOutput, statusFile); err != nil {
-					log.Printf("Failed to write to status file: %s\n", err.Error())
+					c.logger.Printf("Failed to write to status file: %s\n", err.Error())
 				}
 			} else if cmd.Command == GET_CMD {
 				cmd.Status = lastStatus
@@ -76,54 +91,44 @@ func startStatusLocker(cmdChan chan LockerCommand, statusFile string) {
 
 }
 
-func startWorker(projectFolder string, workChan chan struct{}, lockerChan chan LockerCommand) {
-	log.Printf("Starting worker for %s\n", projectFolder)
+func (c *controller) startWorker(projectFolder string, workChan chan struct{}, lockerChan chan lockerCommand) {
+	defer c.logger.Info("Stopping worker")
+	defer c.wg.Done()
+	c.logger.Printf("Starting worker for %s\n", projectFolder)
 	for {
 		select {
+		case <-c.ctx.Done():
+			return
 		case <-workChan:
-			log.Println("Got a job to do")
-			lockerChan <- LockerCommand{Command: SAVE_CMD, Status: "started", Output: ""}
+			c.logger.Println("Got a job to do")
+			lockerChan <- lockerCommand{Command: SAVE_CMD, Status: "started", Output: ""}
 			cmd := exec.Cmd{Dir: projectFolder, Path: "/usr/bin/make", Args: []string{"deploy"}}
 			output, err := cmd.CombinedOutput()
 			status := "ok"
 			if err != nil {
 				status = "failed"
-				log.Println("Job failed")
+				c.logger.Println("Job failed")
 			} else {
-				log.Println("Job completed")
+				c.logger.Println("Job completed")
 			}
-			lockerChan <- LockerCommand{Command: SAVE_CMD, Output: string(output), Status: status}
+			lockerChan <- lockerCommand{Command: SAVE_CMD, Output: string(output), Status: status}
 		case <-time.After(time.Second * 1):
 		}
 	}
 }
 
-type SignatureValidationError struct {
-	Expected string
-	Actual   string
-}
-
-func (e SignatureValidationError) Error() string {
-	return fmt.Sprintf("Signature validation failed. Expected: %s, actual: %s", e.Expected, e.Actual)
-}
-
-func verifySignature(payload *[]byte, signature, secret string) error {
-	mac := hmac.New(sha1.New, []byte(secret))
-	mac.Write(*payload)
-	checkSum := mac.Sum(nil)
-	expectedSignature := fmt.Sprintf("sha1=%x", checkSum)
-	if expectedSignature != signature {
-		return SignatureValidationError{Expected: expectedSignature, Actual: signature}
+func (c *controller) startHTTPD(secret, host, branch string, workChan chan struct{}, lockerChan chan lockerCommand) {
+	c.logger.Printf("Starting HTTPD on %s\n", host)
+	defer c.wg.Done()
+	defer c.logger.Info("Stopping HTTPD")
+	mux := http.NewServeMux()
+	srv := http.Server{
+		Handler: mux,
 	}
-	return nil
-}
-
-func startHTTPD(secret, host, branch string, workChan chan struct{}, lockerChan chan LockerCommand) {
-	log.Printf("Starting HTTPD on %s\n", host)
-	http.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
-			respChan := make(chan LockerCommand, 1)
-			lockerChan <- LockerCommand{Command: GET_CMD, ResponseChan: respChan}
+			respChan := make(chan lockerCommand, 1)
+			lockerChan <- lockerCommand{Command: GET_CMD, ResponseChan: respChan}
 			status := <-respChan
 			if status.Status == "failed" {
 				http.Error(rw, "Last deployement failed", http.StatusInternalServerError)
@@ -142,9 +147,9 @@ func startHTTPD(secret, host, branch string, workChan chan struct{}, lockerChan 
 				return
 			}
 			if branch != "" {
-				eventData := GithubPushEventData{}
+				eventData := githubPushEventData{}
 				if err = json.Unmarshal(payload, &eventData); err != nil {
-					log.Printf("Failed to decode body: %s", err.Error())
+					c.logger.Printf("Failed to decode body: %s", err.Error())
 					http.Error(rw, fmt.Sprintf("Failed to decode body"), http.StatusBadRequest)
 					return
 				}
@@ -163,37 +168,96 @@ func startHTTPD(secret, host, branch string, workChan chan struct{}, lockerChan 
 			}
 		}
 	})
-	http.ListenAndServe(host, nil)
+	go func() {
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+		<-c.ctx.Done()
+		srv.Shutdown(timeoutCtx)
+	}()
+	srv.Addr = host
+	if err := srv.ListenAndServe(); err != nil {
+		if err != http.ErrServerClosed {
+			c.errors <- err
+		}
+	}
 }
 
 func main() {
-	projectFolder := flag.String("project", "", "Project folder containing the Makefile")
-	host := flag.String("host", "127.0.0.1:9876", "Interface and port to listen on")
-	secret := flag.String("secret", "", "Github webhook secret")
-	statusFile := flag.String("statusFile", "", "Status file")
-	branch := flag.String("branch", "", "Restrict deployd to only trigger on a specific branch change")
-	flag.Parse()
+	log := logrus.New()
+	var projectFolder string
+	var host string
+	var secret string
+	var statusFile string
+	var branch string
+	var verbose bool
 
-	if *secret == "" {
-		log.Fatalln("You have to specify a secret using -secret")
+	pflag.StringVar(&projectFolder, "project", "", "Project folder containing the Makefile")
+	pflag.StringVar(&host, "host", "127.0.0.1:9876", "Interface and port to listen on")
+	pflag.StringVar(&secret, "secret", "", "Github webhook secret")
+	pflag.StringVar(&statusFile, "status-file", "", "Status file")
+	pflag.StringVar(&branch, "branch", "", "Restrict deployd to only trigger on a specific branch change")
+	pflag.BoolVar(&verbose, "verbose", false, "Verbose logging")
+	pflag.Parse()
+
+	if verbose {
+		log.SetLevel(logrus.DebugLevel)
+	} else {
+		log.SetLevel(logrus.WarnLevel)
 	}
-	if *projectFolder == "" {
-		log.Fatalln("You have to specify a project folder using -project")
+
+	if secret == "" {
+		log.Fatalln("You have to specify a secret using --secret")
 	}
-	if *statusFile == "" {
-		log.Fatalln("You have to specify a status file using -statusFile")
+	if projectFolder == "" {
+		log.Fatalln("You have to specify a project folder using --project")
 	}
-	if err := checkProjectFolder(*projectFolder); err != nil {
+	if statusFile == "" {
+		log.Fatalln("You have to specify a status file using --status-file")
+	}
+	if err := checkProjectFolder(projectFolder); err != nil {
 		log.Fatalf("The project folder appears to be invalid: %s\n", err.Error())
 	}
 
-	workChannel := make(chan struct{}, 1)
-	lockerChan := make(chan LockerCommand, 5)
-	previousStatus, previousOutput, err := loadStatusFromFile(*statusFile)
-	if err == nil {
-		lockerChan <- LockerCommand{Command: SAVE_CMD, Status: previousStatus, Output: previousOutput}
+	previousStatus, previousOutput, err := loadStatusFromFile(statusFile)
+	if err != nil && !os.IsNotExist(err) {
+		log.WithError(err).Fatal("Failed to load status file")
 	}
-	go startStatusLocker(lockerChan, *statusFile)
-	go startWorker(*projectFolder, workChannel, lockerChan)
-	startHTTPD(*secret, *host, *branch, workChannel, lockerChan)
+
+	wg := sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctrl := controller{
+		ctx:        ctx,
+		cancelFunc: cancel,
+		wg:         &wg,
+		logger:     log,
+		errors:     make(chan error, 3),
+	}
+
+	sigChan := make(chan os.Signal)
+	go func() {
+		sig := <-sigChan
+		log.Warnf("Signal received: %s", sig)
+		cancel()
+	}()
+	signal.Notify(sigChan, syscall.SIGINT)
+
+	workChannel := make(chan struct{}, 1)
+	lockerChan := make(chan lockerCommand, 5)
+	lockerChan <- lockerCommand{Command: SAVE_CMD, Status: previousStatus, Output: previousOutput}
+
+	wg.Add(3)
+
+	go ctrl.startStatusLocker(lockerChan, statusFile)
+	go ctrl.startWorker(projectFolder, workChannel, lockerChan)
+	go ctrl.startHTTPD(secret, host, branch, workChannel, lockerChan)
+
+	wg.Wait()
+
+	select {
+	case e := <-ctrl.errors:
+		log.WithError(e).Fatal("An error occured")
+	default:
+	}
 }
